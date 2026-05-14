@@ -1,0 +1,3 @@
+# Dependencies for policy_retrieval Lambda function
+# boto3 is included in Lambda runtime, but specifying for local development
+boto3>=1.35.0
