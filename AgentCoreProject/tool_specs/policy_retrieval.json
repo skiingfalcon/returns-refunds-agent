@@ -1,0 +1,16 @@
+[
+  {
+    "name": "policy_retrieval",
+    "description": "Retrieve return and refund policy information from the Bedrock Knowledge Base. Searches the knowledge base for relevant policy documents based on the query and returns policy excerpts with relevance scores and metadata (country, company, source).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The policy question or search query (e.g., 'What is the return policy for electronics in the US?')"
+        }
+      },
+      "required": ["query"]
+    }
+  }
+]

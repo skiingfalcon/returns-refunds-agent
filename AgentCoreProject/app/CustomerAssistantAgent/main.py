@@ -1,11 +1,15 @@
-from strands import Agent, tool
+from strands import Agent
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import load_model
-from mcp_client.client import get_streamable_http_mcp_client
 from strands_tools import current_time
+from strands.tools.mcp.mcp_client import MCPClient
+from mcp.client.streamable_http import streamablehttp_client
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, Any
 import os
+import requests
+import base64
+import threading
 
 # Import AgentCore Memory components
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
@@ -14,247 +18,219 @@ from bedrock_agentcore.memory.integrations.strands.session_manager import AgentC
 app = BedrockAgentCoreApp()
 log = app.logger
 
-# Define a Streamable HTTP MCP Client
-mcp_clients = [get_streamable_http_mcp_client()]
-
-# Define a collection of tools used by the model
-tools = []
-
-# Add built-in current_time tool from strands_tools
-tools.append(current_time)
-
-# Mock data for orders, users, and products
-MOCK_ORDERS = {
-    "ORD-001": {
-        "order_id": "ORD-001",
-        "customer_id": "C-01",
-        "product_id": "P-001",
-        "product_name": "iPhone 15 Pro",
-        "status": "DELIVERED",
-        "order_date": (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d"),
-        "delivery_date": (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d"),
-        "price": 999.99
-    },
-    "ORD-002": {
-        "order_id": "ORD-002",
-        "customer_id": "C-02",
-        "product_id": "P-002",
-        "product_name": "Kindle Paperwhite",
-        "status": "DELIVERED",
-        "order_date": (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d"),
-        "delivery_date": (datetime.now() - timedelta(days=42)).strftime("%Y-%m-%d"),
-        "price": 139.99
-    },
-    "ORD-003": {
-        "order_id": "ORD-003",
-        "customer_id": "C-01",
-        "product_id": "P-005",
-        "product_name": "PlayStation 5",
-        "status": "SHIPPED",
-        "order_date": (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d"),
-        "delivery_date": None,
-        "price": 499.99
-    }
-}
-
-MOCK_USERS = {
-    "C-01": {
-        "user_id": "C-01",
-        "name": "Rajesh Kumar",
-        "country": "IN",
-        "email": "rajesh@example.com"
-    },
-    "C-02": {
-        "user_id": "C-02",
-        "name": "Sarah Johnson",
-        "country": "US",
-        "email": "sarah@example.com"
-    },
-    "C-03": {
-        "user_id": "C-03",
-        "name": "James Wilson",
-        "country": "UK",
-        "email": "james@example.com"
-    }
-}
-
-MOCK_PRODUCTS = {
-    "P-001": {
-        "product_id": "P-001",
-        "name": "iPhone 15 Pro",
-        "manufacturer": "Apple",
-        "category": "phone"
-    },
-    "P-002": {
-        "product_id": "P-002",
-        "name": "Kindle Paperwhite",
-        "manufacturer": "Amazon",
-        "category": "e-book"
-    },
-    "P-003": {
-        "product_id": "P-003",
-        "name": "iPad Air",
-        "manufacturer": "Apple",
-        "category": "tablet"
-    },
-    "P-005": {
-        "product_id": "P-005",
-        "name": "PlayStation 5",
-        "manufacturer": "Sony",
-        "category": "electronics"
-    }
-}
-
-MOCK_POLICIES = {
-    "electronics": {
-        "category": "electronics",
-        "return_window_days": 30,
-        "refund_percentage": 100,
-        "conditions": "100% refund if unopened, 85% refund if opened (15% restocking fee)",
-        "notes": "Must include original packaging and accessories"
-    },
-    "clothing": {
-        "category": "clothing",
-        "return_window_days": 60,
-        "refund_percentage": 100,
-        "conditions": "Full refund with tags attached and unworn",
-        "notes": "Free return shipping"
-    },
-    "books": {
-        "category": "books",
-        "return_window_days": 14,
-        "refund_percentage": 50,
-        "conditions": "50% refund for opened books, 100% for unopened",
-        "notes": "Digital books are non-returnable"
-    }
-}
-
-@tool
-def order_lookup(order_id: str) -> str:
+# OAuth Token Manager for Gateway Authentication
+class OAuthTokenManager:
     """
-    Look up order details by order ID.
+    Manages OAuth 2.0 client credentials token lifecycle for gateway authentication.
     
-    Args:
-        order_id: The unique order identifier (e.g., ORD-001)
+    Handles token acquisition, caching, and automatic refresh before expiry.
+    Thread-safe implementation for concurrent access.
+    """
+    
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        token_endpoint: str,
+        scope: str
+    ):
+        """
+        Initialize the OAuth token manager.
         
-    Returns:
-        str: Formatted order details including customer, product, status, and dates
-    """
-    order = MOCK_ORDERS.get(order_id)
-    
-    if not order:
-        return f"Order {order_id} not found in the system."
-    
-    # Format the order details
-    result = f"""Order Details:
-- Order ID: {order['order_id']}
-- Customer ID: {order['customer_id']}
-- Product: {order['product_name']} (ID: {order['product_id']})
-- Status: {order['status']}
-- Order Date: {order['order_date']}
-- Delivery Date: {order['delivery_date'] if order['delivery_date'] else 'Not yet delivered'}
-- Price: ${order['price']:.2f}"""
-    
-    return result
-
-tools.append(order_lookup)
-
-@tool
-def user_lookup(user_id: str) -> str:
-    """
-    Retrieve customer information by user ID.
-    
-    Args:
-        user_id: The unique customer identifier (e.g., C-01)
+        Args:
+            client_id: OAuth client ID
+            client_secret: OAuth client secret
+            token_endpoint: Token endpoint URL
+            scope: OAuth scope for gateway access
+        """
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.token_endpoint = token_endpoint
+        self.scope = scope
         
-    Returns:
-        str: Formatted customer details including name, country, and email
-    """
-    user = MOCK_USERS.get(user_id)
-    
-    if not user:
-        return f"Customer {user_id} not found in the system."
-    
-    # Format the customer details
-    result = f"""Customer Details:
-- Customer ID: {user['user_id']}
-- Name: {user['name']}
-- Country: {user['country']}
-- Email: {user['email']}"""
-    
-    return result
-
-tools.append(user_lookup)
-
-@tool
-def product_lookup(product_id: str) -> str:
-    """
-    Retrieve product information by product ID.
-    
-    Args:
-        product_id: The unique product identifier (e.g., P-001)
+        # Token cache
+        self._access_token: Optional[str] = None
+        self._token_expiry: Optional[datetime] = None
+        self._lock = threading.Lock()
         
-    Returns:
-        str: Formatted product details including name, manufacturer, and category
-    """
-    product = MOCK_PRODUCTS.get(product_id)
+        log.info(f"OAuth Token Manager initialized for scope: {scope}")
     
-    if not product:
-        return f"Product {product_id} not found in the system."
-    
-    # Format the product details
-    result = f"""Product Details:
-- Product ID: {product['product_id']}
-- Name: {product['name']}
-- Manufacturer: {product['manufacturer']}
-- Category: {product['category']}"""
-    
-    return result
-
-tools.append(product_lookup)
-
-@tool
-def policy_retrieval(query: str) -> str:
-    """
-    Retrieve return policy information for a product category.
-    
-    Args:
-        query: The product category to look up (e.g., electronics, clothing, books)
+    def get_access_token(self) -> str:
+        """
+        Get a valid access token, refreshing if necessary.
         
-    Returns:
-        str: Formatted return policy details for the specified category
+        Returns:
+            str: Valid JWT access token
+        """
+        with self._lock:
+            # Check if we have a valid cached token
+            if self._access_token and self._token_expiry:
+                # Refresh token 5 minutes before expiry
+                if datetime.now() < self._token_expiry - timedelta(minutes=5):
+                    log.debug("Using cached access token")
+                    return self._access_token
+            
+            # Token expired or not cached, obtain new token
+            log.info("Obtaining new access token from Cognito")
+            return self._obtain_new_token()
+    
+    def _obtain_new_token(self) -> str:
+        """
+        Obtain a new access token using client credentials flow.
+        
+        Reference: https://docs.aws.amazon.com/cognito/latest/developerguide/token-endpoint.html
+        
+        Returns:
+            str: New JWT access token
+        """
+        try:
+            # Prepare Basic Authentication header
+            # Format: Basic base64(client_id:client_secret)
+            credentials = f"{self.client_id}:{self.client_secret}"
+            encoded_credentials = base64.b64encode(credentials.encode()).decode()
+            
+            # Request access token using client_credentials grant
+            response = requests.post(
+                self.token_endpoint,
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Authorization': f'Basic {encoded_credentials}'
+                },
+                data={
+                    'grant_type': 'client_credentials',
+                    'scope': self.scope
+                },
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                log.error(f"Failed to obtain token: {response.status_code} - {response.text}")
+                raise Exception(f"Token request failed: {response.text}")
+            
+            token_data = response.json()
+            self._access_token = token_data['access_token']
+            
+            # Calculate token expiry (default to 3600 seconds if not provided)
+            expires_in = token_data.get('expires_in', 3600)
+            self._token_expiry = datetime.now() + timedelta(seconds=expires_in)
+            
+            log.info(f"Access token obtained successfully, expires in {expires_in} seconds")
+            return self._access_token
+            
+        except Exception as e:
+            log.error(f"Error obtaining access token: {str(e)}")
+            raise
+
+
+# Global token manager instance
+_token_manager: Optional[OAuthTokenManager] = None
+
+def get_token_manager() -> OAuthTokenManager:
     """
-    # Normalize the query to lowercase for matching
-    category = query.lower().strip()
+    Get or create the global OAuth token manager.
     
-    policy = MOCK_POLICIES.get(category)
+    Returns:
+        OAuthTokenManager: Token manager instance
+    """
+    global _token_manager
     
-    if not policy:
-        # Return all available policies if specific category not found
-        available = ", ".join(MOCK_POLICIES.keys())
-        return f"Policy for '{query}' not found. Available categories: {available}"
+    if _token_manager is None:
+        # Read OAuth configuration from environment variables
+        client_id = os.environ.get("GATEWAY_CLIENT_ID")
+        client_secret = os.environ.get("GATEWAY_CLIENT_SECRET")
+        token_endpoint = os.environ.get("GATEWAY_TOKEN_ENDPOINT")
+        scope = os.environ.get("GATEWAY_SCOPE")
+        
+        if not all([client_id, client_secret, token_endpoint, scope]):
+            raise ValueError(
+                "Missing required OAuth configuration. "
+                "Ensure GATEWAY_CLIENT_ID, GATEWAY_CLIENT_SECRET, "
+                "GATEWAY_TOKEN_ENDPOINT, and GATEWAY_SCOPE are set."
+            )
+        
+        _token_manager = OAuthTokenManager(
+            client_id=client_id,
+            client_secret=client_secret,
+            token_endpoint=token_endpoint,
+            scope=scope
+        )
     
-    # Format the policy details
-    result = f"""Return Policy for {policy['category'].title()}:
-- Return Window: {policy['return_window_days']} days from delivery
-- Refund: {policy['conditions']}
-- Additional Notes: {policy['notes']}"""
+    return _token_manager
+
+
+def create_gateway_mcp_transport():
+    """
+    Create an MCP transport for the AgentCore Gateway with OAuth authentication.
     
-    return result
+    The transport handles HTTP communication with the gateway, including
+    automatic OAuth token management and authorization headers.
+    
+    Reference: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-agent-integration.html
+    
+    Returns:
+        Streamable HTTP transport configured for gateway access
+    """
+    gateway_url = os.environ.get("GATEWAY_URL")
+    
+    if not gateway_url:
+        raise ValueError("GATEWAY_URL environment variable not set")
+    
+    log.info(f"Creating MCP transport for gateway: {gateway_url}")
+    
+    # Get OAuth token manager
+    token_manager = get_token_manager()
+    
+    # Obtain access token
+    access_token = token_manager.get_access_token()
+    
+    # Create transport with Authorization header
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    
+    return streamablehttp_client(gateway_url, headers=headers)
 
-tools.append(policy_retrieval)
 
-# Add MCP client to tools if available
-for mcp_client in mcp_clients:
-    if mcp_client:
-        tools.append(mcp_client)
+# Global MCP client instance
+_mcp_client: Optional[MCPClient] = None
+
+def get_mcp_client() -> MCPClient:
+    """
+    Get or create the global MCP client for gateway access.
+    
+    Returns:
+        MCPClient: MCP client instance
+    """
+    global _mcp_client
+    
+    if _mcp_client is None:
+        log.info("Initializing MCP client for AgentCore Gateway")
+        _mcp_client = MCPClient(create_gateway_mcp_transport)
+    
+    return _mcp_client
 
 
+# Global agent instance
 _agent = None
 
 def get_or_create_agent():
+    """
+    Get or create the global agent instance.
+    
+    The agent is configured with:
+    - Bedrock model for inference
+    - Memory integration for conversation context
+    - Gateway tools via MCP client
+    - Built-in tools (current_time)
+    
+    Returns:
+        Agent: Configured agent instance
+    """
     global _agent
+    
     if _agent is None:
+        log.info("Creating agent with gateway tools")
+        
         # Get memory configuration from environment variables
         memory_id = os.environ.get("AGENTCORE_MEMORY_ID")
         aws_region = os.environ.get("AWS_REGION", "us-west-2")
@@ -266,28 +242,27 @@ def get_or_create_agent():
         session_id = f"session_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
         # Configure memory with retrieval settings for each namespace
-        # Using the exact namespace patterns from agentcore.json
         agentcore_memory_config = AgentCoreMemoryConfig(
             memory_id=memory_id,
             session_id=session_id,
             actor_id=actor_id,
             retrieval_config={
-                # User preferences namespace - retrieve user-specific preferences
+                # User preferences namespace
                 f"/users/{actor_id}/preferences": RetrievalConfig(
                     top_k=5,
                     relevance_score=0.7
                 ),
-                # Semantic facts namespace - retrieve factual information about the user
+                # Semantic facts namespace
                 f"/users/{actor_id}/facts": RetrievalConfig(
                     top_k=10,
                     relevance_score=0.5
                 ),
-                # Summarization namespace - retrieve session summaries
+                # Summarization namespace
                 f"/summaries/{actor_id}/{session_id}": RetrievalConfig(
                     top_k=5,
                     relevance_score=0.6
                 ),
-                # Episodic memory namespace - retrieve episodic memories
+                # Episodic memory namespace
                 f"/episodes/{actor_id}/{session_id}": RetrievalConfig(
                     top_k=8,
                     relevance_score=0.5
@@ -300,6 +275,17 @@ def get_or_create_agent():
             agentcore_memory_config=agentcore_memory_config,
             region_name=aws_region
         )
+        
+        # Get MCP client and load gateway tools
+        mcp_client = get_mcp_client()
+        
+        # Start MCP client - it will remain active for the lifetime of the agent
+        mcp_client.start()
+        gateway_tools = mcp_client.list_tools_sync()
+        log.info(f"Loaded {len(gateway_tools)} tools from gateway")
+        
+        # Combine gateway tools with built-in tools
+        all_tools = [current_time] + gateway_tools
         
         _agent = Agent(
             model=load_model(),
@@ -321,16 +307,35 @@ def get_or_create_agent():
                 - Use available tools to look up order data, calculate refunds, and check policies
                 - Escalate complex cases or policy exceptions to human supervisors when appropriate
                 - Remember user preferences and past interactions to provide personalized assistance
+                
+                Available tools:
+                - current_time: Get current date and time
+                - order_lookup: Look up order details from DynamoDB
+                - user_lookup: Retrieve customer information
+                - product_lookup: Retrieve product information
+                - policy_retrieval: Query return policies from knowledge base
             """,
-            tools=tools,
+            tools=all_tools,
             session_manager=session_manager
         )
+        
+        log.info("Agent created successfully with gateway integration")
+    
     return _agent
 
 
 @app.entrypoint
 async def invoke(payload, context):
-    log.info("Invoking Agent.....")
+    """
+    Agent invocation entrypoint.
+    
+    Processes incoming requests and streams responses back to the caller.
+    
+    Args:
+        payload: Request payload containing the prompt
+        context: Invocation context
+    """
+    log.info("Invoking Agent with gateway tools")
 
     agent = get_or_create_agent()
 

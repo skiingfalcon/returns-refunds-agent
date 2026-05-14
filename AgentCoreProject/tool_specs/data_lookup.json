@@ -1,0 +1,48 @@
+[
+  {
+    "name": "order_lookup",
+    "description": "Look up order details from DynamoDB. Retrieves orders for a specific customer, or a specific order if both customer_id and product_id are provided. Returns order information including purchase date and status.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "customer_id": {
+          "type": "string",
+          "description": "The unique customer identifier (e.g., C-01)"
+        },
+        "product_id": {
+          "type": "string",
+          "description": "Optional: The unique product identifier (e.g., P-001). If provided with customer_id, returns a specific order."
+        }
+      },
+      "required": ["customer_id"]
+    }
+  },
+  {
+    "name": "user_lookup",
+    "description": "Retrieve customer information from DynamoDB. Returns customer details including name and country code.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "customer_id": {
+          "type": "string",
+          "description": "The unique customer identifier (e.g., C-01)"
+        }
+      },
+      "required": ["customer_id"]
+    }
+  },
+  {
+    "name": "product_lookup",
+    "description": "Retrieve product information from DynamoDB. Returns product details including name, provider, and category.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "product_id": {
+          "type": "string",
+          "description": "The unique product identifier (e.g., P-001)"
+        }
+      },
+      "required": ["product_id"]
+    }
+  }
+]
